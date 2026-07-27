@@ -1,7 +1,10 @@
 import sqlite3, os
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "records.db"
@@ -21,39 +24,32 @@ def init_db():
 
 init_db()
 
-app = Flask(__name__)
+app = FastAPI(title="查岗系统")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-@app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "*"
-    return response
+class ReportBody(BaseModel):
+    app_name: str
+    event: str
 
-@app.route("/report", methods=["POST", "OPTIONS"])
-def report():
-    if request.method == "OPTIONS":
-        return ""
-    auth = request.headers.get("Authorization", "")
+@app.post("/report")
+async def report(body: ReportBody, req: Request):
+    auth = req.headers.get("Authorization", "")
     if auth != f"Bearer {AUTH_TOKEN}":
-        return jsonify({"error": "Unauthorized"}), 401
-    body = request.get_json()
-    if not body or "app_name" not in body or "event" not in body:
-        return jsonify({"error": "Missing fields"}), 400
+        raise HTTPException(401, "Unauthorized")
     now = datetime.utcnow().isoformat()
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("INSERT INTO records (app_name, event, timestamp) VALUES (?, ?, ?)",
-                 (body["app_name"], body["event"], now))
+                 (body.app_name, body.event, now))
     conn.commit()
     conn.close()
-    return jsonify({"status": "ok"})
+    return {"status": "ok"}
 
-@app.route("/ping")
-def ping():
+@app.get("/ping")
+async def ping():
     return "pong"
 
-@app.route("/activity/summary")
-def summary():
+@app.get("/activity/summary")
+async def summary():
     conn = sqlite3.connect(str(DB_PATH))
     cur = conn.cursor()
     cur.execute("SELECT app_name, event, timestamp FROM records ORDER BY id DESC LIMIT 5")
@@ -63,17 +59,18 @@ def summary():
     conn.close()
     sessions, opens = {}, {}
     for r in rows:
-        app_name, ev, ts = r
+        app, ev, ts = r
         if ev == "open":
-            opens[app_name] = datetime.fromisoformat(ts)
-        elif ev == "close" and app_name in opens:
-            gap = int((datetime.fromisoformat(ts) - opens[app_name]).total_seconds())
-            sessions[app_name] = sessions.get(app_name, 0) + gap
-            del opens[app_name]
-    return jsonify({
+            opens[app] = datetime.fromisoformat(ts)
+        elif ev == "close" and app in opens:
+            gap = int((datetime.fromisoformat(ts) - opens[app]).total_seconds())
+            sessions[app] = sessions.get(app, 0) + gap
+            del opens[app]
+    return {
         "recent_apps": [r[0] for r in recent],
         "sessions": sessions
-    })
+    }
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
